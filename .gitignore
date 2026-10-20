@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+research/
+*.db
+node_modules/
+frontend/build/
+frontend/.react-router/
+frontend/dist/
+.DS_Store
