@@ -29,6 +29,8 @@ FREEBUFF_BIN = os.getenv("FREEBUFF_BIN", "freebuff").strip() or "freebuff"
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude").strip() or "claude"
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "").strip()
 CODEX_BIN = os.getenv("CODEX_BIN", "codex").strip() or "codex"
+QODER_BIN = os.getenv("QODER_BIN", "qoder").strip() or "qoder"
+QODER_MODEL = os.getenv("QODER_MODEL", "").strip()
 RESEARCH_TIMEOUT = int(
     os.getenv("RESEARCH_TIMEOUT", os.getenv("COMMAND_CODE_TIMEOUT", str(45 * 60)))
 )
@@ -61,6 +63,7 @@ def quote_prompt(prompt: str | None = None) -> str:
 def _command_code_command() -> str:
     return (
         "command-code --yolo --skip-onboarding --print --tools-all "
+        "--output-format json "
         f"--model {COMMAND_CODE_MODEL} {quote_prompt()}"
     )
 
@@ -85,6 +88,14 @@ def _codex_command() -> str:
     return f"codex exec --full-auto {quote_prompt()}"
 
 
+def _qoder_command() -> str:
+    model = f"--model {QODER_MODEL} " if QODER_MODEL else ""
+    return (
+        "qoder --print --output-format stream-json "
+        f"--permission-mode bypass_permissions {model}{quote_prompt()}"
+    ).replace("  ", " ").strip()
+
+
 RESEARCH_PRESETS: list[dict[str, Any]] = [
     {
         "id": "command-code",
@@ -97,8 +108,9 @@ RESEARCH_PRESETS: list[dict[str, Any]] = [
             ("--skip-onboarding",),
             ("--print",),
             ("--tools-all",),
+            ("--output-format", "json"),
         ),
-        "hint": "Default. Keep --print so the browser can stream logs.",
+        "hint": "Print mode with a JSON event stream so the desk can show live progress. --resume reopens a finished session.",
     },
     {
         "id": "opencode",
@@ -144,6 +156,20 @@ RESEARCH_PRESETS: list[dict[str, Any]] = [
         "required_groups": (("exec",), ("--full-auto",)),
         "hint": "OpenAI Codex CLI non-interactive exec mode.",
     },
+    {
+        "id": "qoder",
+        "label": "qoder",
+        "binary": "qoder",
+        "bin_env": "QODER_BIN",
+        "default_bin": QODER_BIN,
+        "build": _qoder_command,
+        "required_groups": (
+            ("--print",),
+            ("--output-format", "stream-json"),
+            ("--permission-mode", "bypass_permissions"),
+        ),
+        "hint": "Qoder CLI print mode. stream-json feeds the live job log, and --resume reopens a finished session.",
+    },
 ]
 
 
@@ -184,6 +210,14 @@ def resolve_binary_path(name: str, configured: str | None = None) -> str | None:
         local = Path.home() / ".opencode/bin/opencode"
         if local.exists():
             return str(local)
+    if name in {"qoder", "qodercli"}:
+        for local in (
+            Path.home() / ".local/bin/qodercli",
+            Path.home() / ".qoder/entry/qoder",
+            Path.home() / ".local/bin/qoder",
+        ):
+            if local.exists():
+                return str(local)
     return None
 
 
@@ -212,6 +246,8 @@ def infer_preset_id(command: str) -> str:
         "freebuff": "freebuff",
         "claude": "claude",
         "codex": "codex",
+        "qoder": "qoder",
+        "qodercli": "qoder",
     }
     return aliases.get(binary, "custom")
 

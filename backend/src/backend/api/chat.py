@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.core.db import db, row_to_dict, utcnow
-from backend.domain.research import run_research_job
+from backend.domain.supervisor import schedule_job
 from backend.master.agent import run_agent_stream
 
 router = APIRouter(prefix="/chat")
@@ -137,7 +137,6 @@ def list_messages(conversation_id: int) -> dict:
 async def post_message(
     conversation_id: int,
     body: MessageCreate,
-    background: BackgroundTasks,
 ) -> StreamingResponse:
     now = utcnow()
     with db() as conn:
@@ -218,17 +217,26 @@ async def post_message(
                                     and result.get("job_id")
                                     and result.get("project_id")
                                 ):
-                                    background.add_task(
-                                        run_research_job,
+                                    schedule_job(
                                         int(result["job_id"]),
                                         int(result["project_id"]),
                                     )
                             else:
-                                for entry in result.get("tasks") or []:
-                                    jid = entry.get("job_id")
-                                    pid = entry.get("project_id")
-                                    if jid and pid:
-                                        background.add_task(run_research_job, jid, pid)
+                                entries = result.get("jobs") or result.get("queued") or []
+                                if not entries:
+                                    entries = [
+                                        item
+                                        for item in (result.get("tasks") or [])
+                                        if item.get("created")
+                                    ]
+                                for entry in entries:
+                                    if entry.get("created") is False:
+                                        continue
+                                    job = entry.get("job") or entry
+                                    jid = job.get("id") or job.get("job_id") or entry.get("job_id")
+                                    pid = job.get("project_id") or entry.get("project_id")
+                                    if jid and pid and entry.get("created", True):
+                                        schedule_job(int(jid), int(pid))
                         except (json.JSONDecodeError, TypeError, ValueError):
                             pass
                 yield _sse(event)

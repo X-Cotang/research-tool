@@ -56,4 +56,10 @@ def get_job_snapshot(job_id: int) -> dict | None:
             )
     if not job:
         return None
-    return {"job": job, "project": project}
+    from backend.domain.supervisor import list_pending_followups
+
+    return {
+        "job": job,
+        "project": project,
+        "followups": list_pending_followups(int(job["project_id"])),
+    }

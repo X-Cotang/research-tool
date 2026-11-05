@@ -4,7 +4,7 @@ import asyncio
 import json
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.api.helpers import org_catalog, remember_org, serialize_cursor, serialize_org, upsert_org, upsert_project
@@ -21,7 +21,8 @@ from backend.core.db import (
     utcnow,
 )
 from backend.domain.jobs import queue_research
-from backend.domain.research import run_research_job, saved_research_command
+from backend.domain.research import saved_research_command
+from backend.domain.supervisor import schedule_job
 from backend.domain.github_client import (
     GitHubError,
     advisory_count,
@@ -403,7 +404,7 @@ async def scan(body: ScanRequest) -> dict:
 
 
 @router.post("/research/repo")
-async def research_repo(body: RepoResearchRequest, background: BackgroundTasks) -> dict:
+async def research_repo(body: RepoResearchRequest) -> dict:
     command = (body.command or saved_research_command()).strip()
     if not command:
         raise HTTPException(status_code=400, detail="Research command cannot be empty.")
@@ -447,7 +448,7 @@ async def research_repo(body: RepoResearchRequest, background: BackgroundTasks) 
         orgs = org_catalog(conn)
 
     if created:
-        background.add_task(run_research_job, job["id"], project["id"])
+        schedule_job(int(job["id"]), int(project["id"]))
 
     remember_org(owner)
     return {

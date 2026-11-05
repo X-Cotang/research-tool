@@ -14,7 +14,8 @@ def build_working_memory() -> dict[str, Any]:
             for r in conn.execute(
                 """
                 SELECT j.id, j.project_id, j.status, j.run_id, j.conversation_id,
-                       j.created_at, j.finished_at, j.error, p.full_name, p.language
+                       j.created_at, j.finished_at, j.error, j.cli_session_id,
+                       j.cli_activity, p.full_name, p.language
                 FROM jobs j
                 JOIN projects p ON p.id = j.project_id
                 WHERE j.status IN ('queued', 'running')

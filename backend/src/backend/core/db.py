@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
+CREATE TABLE IF NOT EXISTS job_followups (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    parent_job_id INTEGER,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    job_id INTEGER,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -213,6 +223,7 @@ PROJECT_COLUMNS = {
     "last_report": "TEXT",
     "researched_at": "TEXT",
     "last_job_id": "INTEGER",
+    "cli_session_id": "TEXT",
     "skipped": "INTEGER NOT NULL DEFAULT 0",
     "reported": "INTEGER NOT NULL DEFAULT 0",
     "false_positive": "INTEGER NOT NULL DEFAULT 0",
@@ -225,6 +236,9 @@ JOB_COLUMNS = {
     "portal_url": "TEXT",
     "run_id": "INTEGER",
     "conversation_id": "INTEGER",
+    "error_step": "TEXT",
+    "cli_session_id": "TEXT",
+    "cli_activity": "TEXT",
 }
 
 SCAN_COLUMNS = {

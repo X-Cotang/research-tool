@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pty
 import re
+import select
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -110,11 +113,13 @@ def parse_research_command(command: str) -> list[str]:
     return parts
 
 
-def _clean_line(line: str) -> str | None:
+def _clean_line(line: str, limit: int | None = 2000) -> str | None:
     text = ANSI_RE.sub("", line).replace("\r", "").rstrip()
     if not text.strip():
         return None
-    return text[:2000]
+    if limit is not None and len(text) > limit:
+        return text[:limit]
+    return text
 
 
 def _append_log(job_id: int, line: str) -> None:
@@ -172,51 +177,222 @@ def clone_repo(clone_url: str, dest: Path, log: LogFn) -> None:
     )
 
 
-def _run_streamed(cmd: list[str], cwd: Path, log: LogFn, timeout: int) -> str:
+def _run_streamed(
+    cmd: list[str],
+    cwd: Path,
+    log: LogFn,
+    timeout: int,
+    progress: Callable[[str | None, str | None], None] | None = None,
+) -> str:
+    """Run a CLI and emit each event as it is printed.
+
+    A pseudo-terminal makes Node flush every line. Piped stdout stays blocked
+    until the process exits, which is why a `--print` run looked idle.
+    """
+    from backend.domain.cli_stream import interpret_cli_line
+
     env = os.environ.copy()
     binary_dir = os.path.dirname(cmd[0])
     if binary_dir:
         env["PATH"] = binary_dir + os.pathsep + env.get("PATH", "")
     env.setdefault("CI", "1")
     env.setdefault("NO_COLOR", "1")
-    env.setdefault("TERM", "dumb")
+    env["TERM"] = "dumb"
     env.setdefault("PYTHONUNBUFFERED", "1")
 
+    master_fd, slave_fd = pty.openpty()
     process = subprocess.Popen(
         cmd,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        stdin=subprocess.DEVNULL,
+        stdout=slave_fd,
+        stderr=slave_fd,
         env=env,
+        start_new_session=True,
     )
+    os.close(slave_fd)
+
     chunks: list[str] = []
-    assert process.stdout is not None
+    final_text = ""
+    pending = ""
+    activity: str | None = "starting"
+    session_id: str | None = None
+    started = time.monotonic()
+    last_output = started
+    last_heartbeat = started
+    deadline = started + timeout
+
+    def note(next_activity: str | None, next_session: str | None) -> None:
+        nonlocal activity, session_id
+        changed = False
+        if next_session and next_session != session_id:
+            session_id = next_session
+            changed = True
+        if next_activity and next_activity != activity:
+            activity = next_activity
+            changed = True
+        if changed and progress:
+            progress(activity, session_id)
+
+    def flush_delta(force: bool = False) -> None:
+        nonlocal pending
+        text = " ".join(pending.split())
+        if not text:
+            pending = ""
+            return
+        if not force and len(text) < 180:
+            return
+        pending = ""
+        log(f"[cli] {_short_progress(text)}")
+        note("writing", session_id)
+
+    def handle_line(line: str) -> None:
+        nonlocal final_text, pending, last_output
+        last_output = time.monotonic()
+        cleaned = _clean_line(line, limit=None)
+        if not cleaned:
+            return
+        decision = interpret_cli_line(cleaned)
+        if decision.get("session_id") or decision.get("activity"):
+            note(decision.get("activity"), decision.get("session_id"))
+        if decision.get("final_text"):
+            final_text = str(decision["final_text"])
+        kind = decision.get("kind")
+        if kind == "delta":
+            pending += str(decision.get("text") or "")
+            flush_delta(False)
+            return
+        if kind == "skip":
+            return
+        flush_delta(True)
+        text = str(decision.get("text") or "")
+        if not text:
+            return
+        chunks.append(text)
+        log(text[:2000])
+        if sum(len(part) for part in chunks) > 400_000:
+            del chunks[:-400]
+
     try:
-        for line in process.stdout:
-            chunks.append(line)
-            cleaned = _clean_line(line)
-            if cleaned:
-                log(cleaned)
-            if sum(len(part) for part in chunks) > 400_000:
-                chunks = chunks[-400:]
-        code = process.wait(timeout=timeout)
+        buffer = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            readable, _, _ = select.select([master_fd], [], [], min(5.0, remaining))
+            now = time.monotonic()
+            if readable:
+                try:
+                    data = os.read(master_fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer or "\r" in buffer:
+                    cut = len(buffer)
+                    for sep in ("\n", "\r"):
+                        pos = buffer.find(sep)
+                        if pos != -1:
+                            cut = min(cut, pos)
+                    line, buffer = buffer[:cut], buffer[cut + 1 :]
+                    handle_line(line)
+            elif process.poll() is not None:
+                buffer += _drain_fd(master_fd)
+                break
+            elif now - last_output >= 12 and now - last_heartbeat >= 12:
+                elapsed = int(now - started)
+                log(f"[cli] still running · {elapsed}s · {activity or 'waiting for output'}")
+                last_heartbeat = now
+                if progress:
+                    progress(activity, session_id)
+        if buffer.strip():
+            handle_line(buffer)
+        flush_delta(True)
+        code = process.wait(timeout=10)
     except subprocess.TimeoutExpired as exc:
-        process.kill()
+        _kill_process_group(process)
         raise ResearchError(f"Command timed out after {timeout}s: {cmd[0]}") from exc
-    output = "".join(chunks).strip()
+    finally:
+        os.close(master_fd)
+
+    output = final_text.strip() or "\n".join(chunks).strip()
     if code != 0:
         raise ResearchError(output[-4000:] or f"{cmd[0]} exited {code}")
     return output
 
 
-def run_research_command(dest: Path, command: str, log: LogFn) -> str:
-    cmd = parse_research_command(command)
+def _drain_fd(fd: int) -> str:
+    parts: list[str] = []
+    while True:
+        readable, _, _ = select.select([fd], [], [], 0)
+        if not readable:
+            break
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        parts.append(data.decode("utf-8", errors="replace"))
+    return "".join(parts)
+
+
+def _short_progress(text: str) -> str:
+    text = " ".join(text.split())
+    if len(text) > 500:
+        return text[:499] + "…"
+    return text
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, 15)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, 9)
+        except ProcessLookupError:
+            pass
+
+
+def run_research_command(
+    dest: Path,
+    command: str,
+    log: LogFn,
+    progress: Callable[[str | None, str | None], None] | None = None,
+) -> str:
+    from backend.domain.worker_command import looks_like_cli
+
+    if not looks_like_cli(command):
+        preview = (command or "").strip().split(" ", 1)[0][:80]
+        raise ResearchError(
+            "Research command is not a CLI invocation. "
+            f"The first token is {preview!r}. Pass a preset plus a prompt, "
+            "or a command that starts with an installed binary such as command-code, "
+            "opencode, claude, codex, freebuff, or qoder."
+        )
+    try:
+        cmd = parse_research_command(command)
+    except ValueError as exc:
+        raise ResearchError(f"Could not parse the research command: {exc}") from exc
+    binary = cmd[0]
+    if not Path(binary).exists() and not resolve_binary_path(Path(binary).name):
+        raise ResearchError(
+            f"CLI binary was not found: {binary}. "
+            "Install it or choose another preset from list_presets."
+        )
     # Log the resolved argv briefly; full enriched prompt can be huge.
     display = command if len(command) < 500 else (command[:240] + " …")
     log(f"$ {display}")
-    return _run_streamed(cmd, dest, log, timeout=RESEARCH_TIMEOUT)
+    try:
+        return _run_streamed(cmd, dest, log, timeout=RESEARCH_TIMEOUT, progress=progress)
+    except FileNotFoundError as exc:
+        missing = getattr(exc, "filename", None) or binary
+        raise ResearchError(f"CLI binary was not found: {missing}") from exc
 
 
 def _compose_report(
@@ -278,30 +454,45 @@ async def run_research_job(job_id: int, project_id: int) -> None:
         return
 
     command = (job.get("command") or saved_research_command()).strip()
+    step = "prepare"
 
     def log(line: str) -> None:
         _append_log(job_id, line)
 
+    def enter(name: str, detail: str = "") -> None:
+        nonlocal step
+        step = name
+        line = f"[step:{name}]"
+        if detail:
+            line = f"{line} {detail}"
+        log(line)
+
     dest = RESEARCH_DIR / project["full_name"]
     try:
-        _set_job(job_id, status="running")
+        enter("prepare", project.get("full_name") or str(project_id))
+        _set_job(job_id, status="running", error_step=step)
         _set_project(project_id, research_status="running", last_job_id=job_id)
+
+        enter("clone", project.get("clone_url") or "")
         await asyncio.to_thread(clone_repo, project["clone_url"], dest, log)
         _set_project(project_id, local_path=str(dest))
         project["local_path"] = str(dest)
         log_hub.publish(job_id, {"type": "meta", "local_path": str(dest)})
 
+        enter("language_profile")
         profile = build_language_profile(project, dest)
         log(
             f"Language profile: primary={profile.get('primary')} "
             f"langs={','.join(profile.get('languages') or [])}"
         )
 
+        enter("sast", profile.get("primary") or "")
         sast = await asyncio.to_thread(run_sast_scan, dest, project, log, profile=profile)
         sast_summary = sast.summary_md if sast.summary_md else ""
         if sast.skipped_reason and not sast.findings:
             log(f"SAST skipped: {sast.skipped_reason}")
 
+        enter("compose_prompt")
         enriched = enrich_research_command(command, profile, sast_summary)
         if enriched != command:
             log("Enriched research prompt with language focus + SAST leads.")
@@ -311,7 +502,23 @@ async def run_research_job(job_id: int, project_id: int) -> None:
 
         notes = dest / NOTES_NAME
         before = notes.stat().st_mtime if notes.exists() else 0
-        analysis = await asyncio.to_thread(run_research_command, dest, command, log)
+        enter("research_cli")
+
+        def on_progress(activity: str | None, session_id: str | None) -> None:
+            fields: dict[str, Any] = {}
+            if activity:
+                fields["cli_activity"] = activity[:240]
+            if session_id:
+                fields["cli_session_id"] = session_id
+            if fields:
+                _set_job(job_id, **fields)
+            if session_id:
+                _set_project(project_id, cli_session_id=session_id)
+
+        analysis = await asyncio.to_thread(
+            run_research_command, dest, command, log, on_progress
+        )
+        enter("write_report")
         if notes.exists() and notes.stat().st_mtime > before:
             report = notes.read_text(encoding="utf-8", errors="replace")
             log(f"Using notes written by the research command: {notes}")
@@ -327,7 +534,8 @@ async def run_research_job(job_id: int, project_id: int) -> None:
             log(f"Wrote {notes}")
 
         finished = utcnow()
-        _set_job(job_id, status="done", report=report, finished_at=finished)
+        enter("finish")
+        _set_job(job_id, status="done", report=report, error_step="", finished_at=finished)
         _set_project(
             project_id,
             research_status="done",
@@ -342,12 +550,23 @@ async def run_research_job(job_id: int, project_id: int) -> None:
 
         on_research_job_finished(job_id)
     except Exception as exc:
-        message = str(exc)
-        log(f"Error: {message}")
-        _set_job(job_id, status="error", error=message, finished_at=utcnow())
-        status = "cloned" if dest.exists() else "error"
-        _set_project(project_id, research_status=status, local_path=str(dest) if dest.exists() else None)
-        log_hub.publish(job_id, {"type": "done", "status": "error", "error": message})
+        message = f"[{step}] {exc}"
+        log(f"Error at step {step}: {exc}")
+        _set_job(
+            job_id,
+            status="error",
+            error=message,
+            error_step=step,
+            finished_at=utcnow(),
+        )
+        fields: dict[str, Any] = {"research_status": "error", "last_job_id": job_id}
+        if dest.exists():
+            fields["local_path"] = str(dest)
+        _set_project(project_id, **fields)
+        log_hub.publish(
+            job_id,
+            {"type": "done", "status": "error", "error": message, "error_step": step},
+        )
         from backend.domain.runs import on_research_job_finished
 
         on_research_job_finished(job_id)

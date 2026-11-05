@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.api.helpers import org_catalog, remember_org, serialize_cursor, serialize_org
@@ -14,7 +14,8 @@ from backend.core.db import (
 from backend.domain.jobs import queue_research
 from backend.domain.library import delete_project
 from backend.domain.prompt_suggest import suggest_prompt
-from backend.domain.research import run_research_job, saved_research_command
+from backend.domain.research import saved_research_command
+from backend.domain.supervisor import schedule_job
 
 router = APIRouter()
 
@@ -189,7 +190,6 @@ def remove_project(project_id: int, mode: str = "full") -> dict:
 @router.post("/projects/{project_id}/research")
 def start_research(
     project_id: int,
-    background: BackgroundTasks,
     body: ResearchRequest = ResearchRequest(),
 ) -> dict:
     command = (body.command or saved_research_command()).strip()
@@ -206,7 +206,7 @@ def start_research(
             conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         )
     if created:
-        background.add_task(run_research_job, job["id"], project_id)
+        schedule_job(int(job["id"]), project_id)
     return {"job": job, "project": project, "created": created}
 
 

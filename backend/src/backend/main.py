@@ -20,7 +20,13 @@ async def lifespan(_app: FastAPI):
     init_db()
     recover_stale_jobs()
     sync_research_dir()
-    yield
+    from backend.domain.supervisor import supervise_forever
+
+    supervisor_task = asyncio.create_task(supervise_forever())
+    try:
+        yield
+    finally:
+        supervisor_task.cancel()
 
 
 app = FastAPI(title="Research Tool", version="0.2.0", lifespan=lifespan)

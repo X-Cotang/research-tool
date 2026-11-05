@@ -11,27 +11,54 @@ NOTE_FILES = ("RESEARCH_NOTES.md", "FINDINGS.md")
 
 def recover_stale_jobs() -> None:
     now = utcnow()
+    notice = (
+        "[step:interrupted] Server restarted while this job was queued or running. "
+        "No later step output was captured.\n"
+    )
     with db() as conn:
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status = 'error',
-                error = 'Interrupted when the server restarted.',
-                finished_at = COALESCE(finished_at, ?)
-            WHERE status IN ('queued', 'running')
-            """,
-            (now,),
-        )
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE status = 'running'"
+        ).fetchall()
+        job_ids = [int(row["id"]) for row in rows]
+        if job_ids:
+            placeholders = ",".join("?" for _ in job_ids)
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'error',
+                    error_step = 'interrupted',
+                    error = '[interrupted] Interrupted when the server restarted.',
+                    log = CASE
+                        WHEN log IS NULL OR log = '' THEN ?
+                        ELSE log || ?
+                    END,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE id IN ({placeholders})
+                """,
+                (notice, notice, now, *job_ids),
+            )
         conn.execute(
             """
             UPDATE projects
-            SET research_status = CASE
-                WHEN local_path IS NOT NULL AND local_path != '' THEN 'cloned'
-                ELSE 'idle'
-            END
-            WHERE research_status IN ('queued', 'running')
+            SET research_status = 'error'
+            WHERE research_status = 'running'
             """
         )
+    from backend.domain.runs import on_research_job_finished
+
+    with db() as conn:
+        stuck = conn.execute(
+            """
+            SELECT DISTINCT j.id
+            FROM jobs j
+            JOIN run_tasks rt ON rt.job_id = j.id
+            WHERE rt.status IN ('queued', 'running')
+              AND j.status IN ('done', 'error')
+            """
+        ).fetchall()
+    pending_ids = list(dict.fromkeys([*job_ids, *[int(row["id"]) for row in stuck]]))
+    for job_id in pending_ids:
+        on_research_job_finished(job_id)
 
 
 def iter_local_clones() -> list[Path]:
@@ -49,6 +76,117 @@ def iter_local_clones() -> list[Path]:
 
 def has_research_output(path: Path) -> bool:
     return any((path / name).exists() for name in NOTE_FILES)
+
+
+def research_folder_summary(*, group: str = "all", limit: int = 40) -> dict:
+    """Count checkouts still in the research folder.
+
+    on_disk is a clone that has not been dropped. reported and unreported
+    are split from that set. clone_removed is a library row whose checkout
+    is already gone.
+    """
+    selected = (group or "all").strip().lower()
+    if selected not in {"all", "on_disk", "unreported", "reported", "false_positive", "dropped"}:
+        selected = "all"
+    cap = max(1, min(int(limit or 40), 80))
+    clones = iter_local_clones()
+    disk_names = {f"{path.parent.name}/{path.name}".lower(): path for path in clones}
+    with db() as conn:
+        rows = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, full_name, language, stars, research_status,
+                       skipped, reported, false_positive, local_path
+                FROM projects
+                """
+            ).fetchall()
+        ]
+    by_name = {
+        str(row.get("full_name") or "").lower(): row
+        for row in rows
+        if row and row.get("full_name")
+    }
+
+    def card(full_name: str, row: dict | None, path: Path | None) -> dict:
+        reported = bool(row and row.get("reported"))
+        false_positive = bool(row and row.get("false_positive"))
+        return {
+            "id": row.get("id") if row else None,
+            "full_name": row.get("full_name") if row else full_name,
+            "language": row.get("language") if row else None,
+            "stars": row.get("stars") if row else None,
+            "research_status": row.get("research_status") if row else "untracked",
+            "skipped": bool(row and row.get("skipped")),
+            "reported": reported,
+            "false_positive": false_positive,
+            "on_disk": path is not None,
+        }
+
+    on_disk: list[dict] = []
+    for key, path in sorted(disk_names.items()):
+        row = by_name.get(key)
+        full_name = row.get("full_name") if row else f"{path.parent.name}/{path.name}"
+        on_disk.append(card(str(full_name), row, path))
+
+    reported = [item for item in on_disk if item["reported"]]
+    false_positive = [item for item in on_disk if item["false_positive"] and not item["reported"]]
+    unreported = [item for item in on_disk if not item["reported"] and not item["false_positive"]]
+
+    dropped: list[dict] = []
+    for row in rows:
+        if not row or not row.get("full_name"):
+            continue
+        if str(row["full_name"]).lower() in disk_names:
+            continue
+        had_clone = bool(row.get("local_path")) or row.get("research_status") in {
+            "cloned",
+            "done",
+            "error",
+        } or bool(row.get("reported")) or bool(row.get("false_positive"))
+        if not had_clone:
+            continue
+        dropped.append(card(str(row["full_name"]), row, None))
+
+    groups = {
+        "on_disk": on_disk,
+        "unreported": unreported,
+        "reported": reported,
+        "false_positive": false_positive,
+        "dropped": dropped,
+    }
+
+    def pack(name: str) -> dict:
+        items = groups[name]
+        # The full on-disk list repeats the reported and unreported lists.
+        show_names = selected == name or (selected == "all" and name != "on_disk")
+        return {
+            "count": len(items),
+            "projects": items[:cap] if show_names else [],
+            "truncated": len(items) > cap and show_names,
+        }
+
+    return {
+        "research_dir": str(RESEARCH_DIR),
+        "counts": {
+            "on_disk": len(on_disk),
+            "unreported": len(unreported),
+            "reported": len(reported),
+            "false_positive": len(false_positive),
+            "dropped": len(dropped),
+        },
+        "on_disk": pack("on_disk"),
+        "unreported": pack("unreported"),
+        "reported": pack("reported"),
+        "false_positive": pack("false_positive"),
+        "dropped": pack("dropped"),
+        "hint": (
+            "on_disk is still in the research folder and has not been deleted. "
+            "unreported and reported are split from that set. "
+            "dropped means the checkout is gone and the library row was kept. "
+            "Pass group=unreported, reported, on_disk, or dropped to list one set."
+        ),
+    }
 
 
 def sync_research_dir() -> None:

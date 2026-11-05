@@ -8,7 +8,7 @@ Local security-research desk: discover GitHub targets, run CLI analysis workers,
 |-------|------|
 | Frontend | React Router 8, Tailwind 4, Vite |
 | Backend | FastAPI, SQLite, httpx |
-| Workers | External CLIs (`command-code`, `opencode`, `freebuff`, `claude`, `codex`) |
+| Workers | External CLIs (`command-code`, `opencode`, `freebuff`, `claude`, `codex`, `qoder`) |
 | AI Master | Built-in OpenAI-compatible tool-calling agent (not a CLI) |
 
 ## Quick start
