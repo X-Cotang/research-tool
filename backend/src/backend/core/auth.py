@@ -127,7 +127,8 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         request = Request(scope)
-        if request.method == "OPTIONS" or not request.url.path.startswith("/api"):
+        path = request.url.path
+        if request.method == "OPTIONS" or not (path.startswith("/api") or path.startswith("/mcp")):
             await self.app(scope, receive, send)
             return
         if (request.method, request.url.path) in _PUBLIC:

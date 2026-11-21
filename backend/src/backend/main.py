@@ -26,6 +26,9 @@ from backend.core.auth import AuthMiddleware
 from backend.core.db import init_db
 from backend.domain.library import recover_stale_jobs, sync_research_dir
 from backend.domain.logs import log_hub
+from backend.mcp_desk import mcp_http_app
+
+_mcp_app = mcp_http_app()
 
 
 @asynccontextmanager
@@ -39,7 +42,8 @@ async def lifespan(_app: FastAPI):
 
     supervisor_task = asyncio.create_task(supervise_forever())
     try:
-        yield
+        async with _mcp_app.router.lifespan_context(_mcp_app):
+            yield
     finally:
         supervisor_task.cancel()
 
@@ -72,6 +76,7 @@ app.include_router(prompts.router, prefix=_prefix, tags=["prompts"])
 app.include_router(runs.router, prefix=_prefix, tags=["runs"])
 app.include_router(findings.router, prefix=_prefix, tags=["findings"])
 app.include_router(agent.router, prefix=_prefix, tags=["agent"])
+app.mount("/mcp", _mcp_app)
 
 
 def main() -> None:
