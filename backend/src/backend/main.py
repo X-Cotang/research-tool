@@ -6,8 +6,23 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api import agent, chat, findings, jobs, library, orgs, projects, prompts, runs, settings, skills, status
+from backend.api import (
+    agent,
+    auth,
+    chat,
+    findings,
+    jobs,
+    library,
+    orgs,
+    projects,
+    prompts,
+    runs,
+    settings,
+    skills,
+    status,
+)
 from backend.core import config
+from backend.core.auth import AuthMiddleware
 from backend.core.db import init_db
 from backend.domain.library import recover_stale_jobs, sync_research_dir
 from backend.domain.logs import log_hub
@@ -31,6 +46,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Research Tool", version="0.2.0", lifespan=lifespan)
 
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -43,6 +59,7 @@ app.add_middleware(
 )
 
 _prefix = "/api"
+app.include_router(auth.router, prefix=f"{_prefix}/auth", tags=["auth"])
 app.include_router(status.router, prefix=_prefix, tags=["status"])
 app.include_router(settings.router, prefix=_prefix, tags=["settings"])
 app.include_router(orgs.router, prefix=_prefix, tags=["orgs"])

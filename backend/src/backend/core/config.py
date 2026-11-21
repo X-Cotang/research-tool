@@ -52,6 +52,12 @@ COMMAND_CODE_PROMPT = RESEARCH_PROMPT
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8765"))
 
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "").strip()
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "").strip()
+# Issued JWTs stay valid for one year.
+AUTH_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60
+
 DEFAULT_PRESET_ID = "command-code"
 
 
